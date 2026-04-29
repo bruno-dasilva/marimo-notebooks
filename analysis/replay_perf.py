@@ -27,14 +27,31 @@ def _():
 def _(PERF_DIR):
     # Lazy: just enumerate filenames, don't read content. With hundreds of
     # 10+ MB ndjsons this matters — full content is loaded only for the
-    # currently selected replay below.
-    replay_files = sorted(PERF_DIR.glob("*.ndjson"))
-    return (replay_files,)
+    # currently selected replay below. Prefer .ndjson.gz when both exist.
+    import gzip
+
+    def replay_stem(p):
+        if p.name.endswith(".ndjson.gz"):
+            return p.name[: -len(".ndjson.gz")]
+        if p.name.endswith(".ndjson"):
+            return p.name[: -len(".ndjson")]
+        return p.stem
+
+    def read_ndjson_text(p):
+        if p.name.endswith(".gz"):
+            with gzip.open(p, "rt", encoding="utf-8") as fh:
+                return fh.read()
+        return p.read_text()
+
+    gz_map = {replay_stem(p): p for p in PERF_DIR.glob("*.ndjson.gz")}
+    plain = [p for p in PERF_DIR.glob("*.ndjson") if replay_stem(p) not in gz_map]
+    replay_files = sorted(list(gz_map.values()) + plain, key=lambda p: p.name)
+    return read_ndjson_text, replay_files, replay_stem
 
 
 @app.cell
-def _(mo, replay_files):
-    replay_options = {p.stem: i for i, p in enumerate(replay_files)}
+def _(mo, replay_files, replay_stem):
+    replay_options = {replay_stem(p): i for i, p in enumerate(replay_files)}
     replay_dropdown = mo.ui.dropdown(
         options=replay_options,
         value=next(iter(replay_options)) if replay_options else None,
@@ -46,12 +63,12 @@ def _(mo, replay_files):
 
 
 @app.cell
-def _(json, pl, replay_dropdown, replay_files):
+def _(json, pl, read_ndjson_text, replay_dropdown, replay_files):
     # Read just the selected file. extract-perf appends a `meta` row at the
     # end of each replay block; if a single file has multiple meta rows
     # (e.g. concatenated batch outputs), we take the LAST segment.
     _path = replay_files[replay_dropdown.value]
-    _all_rows = [json.loads(l) for l in _path.read_text().splitlines() if l]
+    _all_rows = [json.loads(l) for l in read_ndjson_text(_path).splitlines() if l]
     _meta_indices = [i for i, r in enumerate(_all_rows) if r.get("kind") == "meta"]
     if len(_meta_indices) > 1:
         _start = _meta_indices[-2] + 1  # start of last segment
