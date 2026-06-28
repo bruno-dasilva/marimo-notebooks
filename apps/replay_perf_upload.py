@@ -12,22 +12,20 @@
 
 import marimo
 
-__generated_with = "0.23.11"
+__generated_with = "0.23.0"
 app = marimo.App(width="full")
 
 
 @app.cell
 def _(mo):
-    mo.md(
-        """
-        # Replay performance — upload a `.sdfz`
+    mo.md("""
+    # Replay performance — upload a `.sdfz`
 
-        Drop a Beyond All Reason demo below. It's parsed **entirely in your
-        browser** (no upload to any server) to show per-player sim-frame timing,
-        render FPS, server speed, a whole-game summary, and the hardware each
-        player reported.
-        """
-    )
+    Drop a Beyond All Reason demo below. It's parsed **entirely in your
+    browser** (no upload to any server) to show per-player sim-frame timing,
+    render FPS, server speed, a whole-game summary, and the hardware each
+    player reported.
+    """)
     return
 
 
@@ -63,7 +61,8 @@ def _(pl):
     SAT_EPS = 1e-3
 
     # packet ids we act on; everything else is skipped by length
-    STARTPLAYING, INTERNAL_SPEED, GAMEOVER, PLAYERINFO, LUAMSG = 4, 20, 30, 38, 50
+    PAUSE, STARTPLAYING, INTERNAL_SPEED, GAMEOVER, PLAYERINFO, LUAMSG = (
+        13, 4, 20, 30, 38, 50)
 
     _PLAYERINFO = struct.Struct("<Bfi")   # playerNum u8, cpuUsage f32, ping i32
     _F32 = struct.Struct("<f")
@@ -89,6 +88,7 @@ def _(pl):
         "cpuUsage": pl.Float64, "ping": pl.Int64,
     }
     _FPS_SCHEMA = {"playerNum": pl.Int64, "t": pl.Float64, "fps": pl.Float64}
+    _PAUSE_SCHEMA = {"t": pl.Float64}
     _PLAYERS_SCHEMA = {
         "playerNum": pl.Int64, "name": pl.Utf8, "teamId": pl.Int64,
         "allyTeamId": pl.Int64, "is_spectator": pl.Boolean, "faction": pl.Utf8,
@@ -99,6 +99,14 @@ def _(pl):
                 "gpuMemory", "maxRes", "display", "windowMode", "os", "lobby"]
     _HW_SCHEMA = {"playerNum": pl.Int64, "name": pl.Utf8,
                   **{c: pl.Utf8 for c in _HW_COLS}}
+    # Real measured sim/draw frame times broadcast by the engine-side gadget
+    # game_frametime_broadcast.lua ("#ft<simN>/<drawN>/<avgSim>/<simPeak>/
+    # <avgDraw>/<drawPeak>", every 2s). Present only in recent BAR builds.
+    _FT_SCHEMA = {
+        "playerNum": pl.Int64, "t": pl.Float64, "simN": pl.Int64,
+        "drawN": pl.Int64, "avgSim": pl.Float64, "simPeak": pl.Float64,
+        "avgDraw": pl.Float64, "drawPeak": pl.Float64,
+    }
 
     def _derive_sim_frame_ms(cpu_usage, internal_speed, last_fps):
         if not math.isfinite(cpu_usage) or cpu_usage < 0 or cpu_usage > 1 + SAT_EPS:
@@ -225,6 +233,9 @@ def _(pl):
     def _build_players(root):
         game = root.get("game", {})
         map_name = game.get("mapname")
+        # BAR game version, e.g. "Beyond All Reason test-28379-33ba377"
+        # (locally recorded demos may carry the literal "$VERSION").
+        game_version = game.get("gametype")
         teams = {}
         for key, val in game.items():
             if isinstance(val, dict) and key.startswith("team") and key[4:].isdigit():
@@ -250,7 +261,7 @@ def _(pl):
                 "country": val.get("countrycode"),
                 "skill": val.get("skill"),
             })
-        return map_name, players
+        return map_name, game_version, players
 
     def parse_demo_bytes(raw):
         sdf = gzip.decompress(raw)
@@ -259,11 +270,13 @@ def _(pl):
         r.off = h["headerSize"]
         script_text = r.read(h["scriptSize"]).decode("utf-8", "replace")
         stream = r.read(h["demoStreamSize"])
-        map_name, players = _build_players(_parse_tdf(script_text))
+        map_name, game_version, players = _build_players(_parse_tdf(script_text))
 
         # columnar accumulators — avoid per-row tuple/object overhead
         c_pid, c_t, c_sim, c_q, c_isp, c_cpu, c_ping = [], [], [], [], [], [], []
         f_pid, f_t, f_fps = [], [], []
+        ft_rows = []
+        pause_t = []  # game time of each pause-start (NETMSG_PAUSE, bPaused=1)
         hardware = {}
         last_fps = {}
         internal_speed = 1.0
@@ -291,12 +304,18 @@ def _(pl):
 
             if pid == PLAYERINFO:
                 player_num, cpu_usage, ping = pi_unpack(buf, off + 1)
+                # cpuUsage-derived approximation (the Time Series tab). The real
+                # engine-measured sim/draw times live in frametime_df and are
+                # shown on the Frame Time tab instead.
                 sim, qual = _derive_sim_frame_ms(
                     cpu_usage, internal_speed, last_fps.get(player_num))
                 ap_pid(player_num); ap_t(t); ap_sim(sim); ap_q(qual)
                 ap_isp(internal_speed); ap_cpu(cpu_usage); ap_ping(ping)
             elif pid == INTERNAL_SPEED:
                 internal_speed = _F32.unpack_from(buf, off + 1)[0]
+            elif pid == PAUSE:  # [playerNum u8, bPaused u8]; record pause starts
+                if buf[off + 2] == 1:
+                    pause_t.append(t)
             elif pid == STARTPLAYING:
                 if game_start is None and _I32.unpack_from(buf, off + 1)[0] == 0:
                     game_start = mod_game_time
@@ -315,6 +334,17 @@ def _(pl):
                             pn = buf[off + 3]
                             last_fps[pn] = fps
                             af_pid(pn); af_t(t); af_fps(fps)
+                    elif msg[:3] == b"#ft":  # FRAME_TIME (real measured sim/draw ms)
+                        pn = buf[off + 3]
+                        try:
+                            v = [float(x) for x in
+                                 msg.decode("latin-1")[3:].split("/")]
+                        except ValueError:
+                            v = None
+                        if v and len(v) >= 6:
+                            ft_rows.append(
+                                (pn, t, int(v[0]), int(v[1]),
+                                 v[2], v[3], v[4], v[5]))
                     elif msg[:3] == b"$y$":  # SYSTEM_INFO
                         pn = buf[off + 3]
                         if pn not in hardware:
@@ -324,8 +354,13 @@ def _(pl):
             off += length
 
         if duration_s is None:
-            # No GAMEOVER: mirror demo-parser.ts (falls back to wallclockTime).
-            duration_s = float(h["wallclockTime"])
+            # No GAMEOVER: prefer wallclockTime (demo-parser.ts), but locally
+            # recorded skirmish demos carry wallclockTime=0, so fall back to the
+            # last observed event time.
+            last_event_t = max(
+                (acc[-1] for acc in (c_t, f_t) if acc),
+                default=(ft_rows[-1][1] if ft_rows else 0.0))
+            duration_s = float(h["wallclockTime"]) or last_event_t
         winning_team = winning_ally[0] if winning_ally else None
         started = datetime.fromtimestamp(
             h["startTime"], tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
@@ -359,16 +394,32 @@ def _(pl):
         ]
         hardware_df = pl.DataFrame(hw_rows, schema=_HW_SCHEMA)
 
+        frametime_df = pl.DataFrame(
+            {"playerNum": [r[0] for r in ft_rows], "t": [r[1] for r in ft_rows],
+             "simN": [r[2] for r in ft_rows], "drawN": [r[3] for r in ft_rows],
+             "avgSim": [r[4] for r in ft_rows], "simPeak": [r[5] for r in ft_rows],
+             "avgDraw": [r[6] for r in ft_rows], "drawPeak": [r[7] for r in ft_rows]},
+            schema=_FT_SCHEMA,
+        )
+
+        # Pause-start markers (game time). Sim time freezes during a pause
+        # (the chunk timestamp is frame-number-derived: startTime + frame/30,
+        # NetProtocol.cpp:GetPacketTime), so a pause is a single instant on the
+        # game-time axis — we mark where, not how long (real duration isn't
+        # recoverable from a client demo).
+        pause_df = pl.DataFrame({"t": pause_t}, schema=_PAUSE_SCHEMA).unique().sort("t")
+
         replay_row = {
             "map": map_name, "engine_version": h["versionString"],
-            "bar_build": None, "duration_s": duration_s,
+            "bar_build": game_version, "duration_s": duration_s,
             "frame_rate": GAME_SPEED, "started": started,
         }
         return {
             "replay_row": replay_row, "frame_rate": GAME_SPEED,
             "duration_s": duration_s, "perf_df": perf_df, "fps_df": fps_df,
             "players_all": players_all, "players_enriched": players_enriched,
-            "hardware_df": hardware_df,
+            "hardware_df": hardware_df, "frametime_df": frametime_df,
+            "pause_df": pause_df,
         }
 
     def empty_result():
@@ -384,6 +435,8 @@ def _(pl):
                 "playerNum", "name", "teamId", "allyTeamId", "is_spectator"),
             "players_enriched": players_enriched,
             "hardware_df": pl.DataFrame(schema=_HW_SCHEMA),
+            "frametime_df": pl.DataFrame(schema=_FT_SCHEMA),
+            "pause_df": pl.DataFrame(schema=_PAUSE_SCHEMA),
         }
 
     return empty_result, parse_demo_bytes
@@ -416,6 +469,8 @@ def _(empty_result, mo, parse_demo_bytes, pl, uploader):
     players_all = _res["players_all"]
     players_enriched = _res["players_enriched"]
     hardware_df = _res["hardware_df"]
+    frametime_df = _res["frametime_df"]
+    pause_df = _res["pause_df"]
 
     # Server-side speed is the same for all players at a given frame; one
     # player's series is enough. Pick the lowest playerNum to be stable.
@@ -437,7 +492,9 @@ def _(empty_result, mo, parse_demo_bytes, pl, uploader):
     return (
         duration_s,
         fps_df,
+        frametime_df,
         hardware_df,
+        pause_df,
         perf_df,
         players_all,
         players_enriched,
@@ -478,9 +535,15 @@ def _(duration_s, mo, players_df, players_enriched, replay_row):
         players_enriched.row(0, named=True) if players_enriched.height else None
     )
 
+    # BAR game version from the start script's gametype, trimmed of the
+    # "Beyond All Reason " prefix (e.g. "test-28379-33ba377").
+    _bar_version = (replay_row.get("bar_build") or "").removeprefix(
+        "Beyond All Reason ").strip() or "—"
+
     cards = [
         mo.stat(label="Map", value=replay_row.get("map") or "—"),
         mo.stat(label="Duration", value=_fmt_dur(duration_s)),
+        mo.stat(label="BAR version", value=_bar_version),
         mo.stat(label="Engine", value=replay_row.get("engine_version") or "—"),
         mo.stat(label="Players", value=str(players_df.height)),
     ]
@@ -499,11 +562,6 @@ def _(duration_s, mo, players_df, players_enriched, replay_row):
 
 @app.cell
 def _(mo, players_df):
-    quality_filter = mo.ui.multiselect(
-        options=["exact", "approx", "saturated", "invalid"],
-        value=["exact", "approx"],
-        label="simFrameMs quality",
-    )
     smoothing = mo.ui.slider(
         start=0,
         stop=60,
@@ -523,21 +581,25 @@ def _(mo, players_df):
         value=list(name_to_pid.keys()),
         label="Players",
     )
-    mo.vstack(
-        [
-            mo.hstack([quality_filter, smoothing], justify="start", gap=2),
-            player_selector,
-        ]
+    # Which measured frame-time stat(s) to draw on the Frame Time tab.
+    stat_filter = mo.ui.multiselect(
+        options=["mean", "peak"],
+        value=["mean", "peak"],
+        label="Frame time stat",
     )
-    return player_selector, quality_filter, smoothing
+    mo.vstack([smoothing, player_selector, stat_filter])
+    return player_selector, smoothing, stat_filter
 
 
 @app.cell
 def _(players_df):
+    # Bright, well-separated hues tuned for a dark background (Material 300/400
+    # level) — the default matplotlib palette muddies on dark. Ordered so
+    # adjacent entries (often teammates after the sort below) stay distinct.
     _palette = [
-        "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", "#8c564b",
-        "#e377c2", "#7f7f7f", "#bcbd22", "#17becf", "#aec7e8", "#ffbb78",
-        "#98df8a", "#ff9896", "#c5b0d5", "#c49c94",
+        "#4FC3F7", "#FF8A65", "#81C784", "#BA68C8", "#FFD54F", "#4DD0E1",
+        "#F06292", "#AED581", "#9575CD", "#FFB74D", "#4DB6AC", "#E57373",
+        "#7986CB", "#DCE775", "#A1887F", "#90A4AE",
     ]
     # Order by team then in-game player id (not alphabetically) so the color
     # scale domain — and therefore every chart legend — groups teammates
@@ -551,9 +613,86 @@ def _(players_df):
 
 
 @app.cell
-def _(alt, duration_s, fps_df, perf_df, pl, speed_df):
-    # --- Game Health tab ---------------------------------------------------
-    # Server speed timeline — only `internalSpeed` (userSpeed carries no signal).
+def _(alt, frametime_df, mo, pause_df, perf_df, pl):
+    # --- Zoom scrubbers ----------------------------------------------------
+    # One thin overview strip per tab. Drag a horizontal interval on it to pick
+    # a time window; the detail charts below read that range (zoom_domain) and
+    # clamp their x-axis to it. Double-click the strip to clear/reset.
+    # (An interval brush can't rescale its own chart in Vega, so the detail
+    #  charts can't self-zoom — hence the dedicated scrubber.)
+    def _scrubber(df, value_col, label):
+        brush = alt.selection_interval(encodings=["x"])
+        if df.is_empty():
+            data = pl.DataFrame({"t": [0.0], "v": [0.0]})
+        else:
+            data = (
+                df.filter(pl.col(value_col).is_not_null())
+                .group_by((pl.col("t") // 1).alias("t"))
+                .agg(v=pl.col(value_col).mean())
+                .sort("t")
+            )
+        chart = (
+            alt.Chart(data)
+            .mark_area(opacity=0.4, color="#1f77b4", interpolate="monotone")
+            .encode(
+                x=alt.X("t:Q", title=label),
+                y=alt.Y("v:Q", axis=None, title=None),
+            )
+            .properties(height=58, width="container")
+            .add_params(brush)
+        )
+        return mo.ui.altair_chart(chart, legend_selection=False)
+
+    def zoom_domain(scrubber):
+        # The brushed window as [t0, t1]; None when nothing (or everything) is
+        # selected, in which case detail charts use their full auto domain.
+        try:
+            ts = scrubber.value["t"]
+            if len(ts) == 0:
+                return None
+            lo, hi = float(ts.min()), float(ts.max())
+        except Exception:
+            return None
+        return [lo, hi] if hi > lo else None
+
+    def pause_marks(dom, xscale):
+        # Dashed vertical rules at each pause (game time). A pause is a single
+        # instant on this axis — sim time freezes while paused — so we mark
+        # where, not for how long. Returns a layerable Chart, or None.
+        if pause_df.is_empty():
+            return None
+        pm = pause_df
+        if dom:
+            pm = pm.filter(pl.col("t").is_between(dom[0], dom[1]))
+        if pm.is_empty():
+            return None
+        return (
+            alt.Chart(pm)
+            .mark_rule(color="#B0BEC5", strokeDash=[4, 3], strokeWidth=1.2,
+                       opacity=0.8, clip=True)
+            .encode(
+                x=alt.X("t:Q", scale=xscale),
+                tooltip=[alt.Tooltip("t:Q", format=".0f", title="pause @ game s")],
+            )
+        )
+
+    _label = "drag to select a time window · double-click to reset"
+    # One scrubber drives every chart on the combined Performance tab. Prefer
+    # the measured avgSim series; fall back to the perf approximation so the
+    # strip still renders for demos with no #ft broadcasts.
+    if frametime_df.is_empty():
+        scrubber = _scrubber(perf_df, "simFrameMs", _label)
+    else:
+        scrubber = _scrubber(frametime_df, "avgSim", _label)
+    return pause_marks, scrubber, zoom_domain
+
+
+@app.cell
+def _(alt, duration_s, mo, pause_marks, pl, scrubber, speed_df, zoom_domain):
+    # --- Sim speed (shown on the Performance tab) --------------------------
+    _dom = zoom_domain(scrubber)
+    _xscale = alt.Scale(domain=_dom) if _dom else alt.Undefined
+    # Server/sim speed timeline — only `internalSpeed` (userSpeed carries no signal).
     if speed_df.is_empty():
         speed_long = pl.DataFrame(
             {"t": [0.0, duration_s], "value": [1.0, 1.0],
@@ -571,78 +710,61 @@ def _(alt, duration_s, fps_df, perf_df, pl, speed_df):
             .with_columns(signal=pl.lit("internalSpeed"))
         )
 
+    # Clip the step series to the zoom window like the other charts (filter the
+    # data rather than relying on a layered scale domain). Carry the speed
+    # active at the window's start, and extend the last value to the window's
+    # end so the step line spans edge-to-edge even with no changes inside.
+    if _dom:
+        _t0, _t1 = _dom
+        _before = speed_long.filter(pl.col("t") <= _t0).tail(1)
+        _win = speed_long.filter((pl.col("t") > _t0) & (pl.col("t") < _t1))
+        _start = (float(_before["value"][-1]) if _before.height
+                  else (float(_win["value"][0]) if _win.height else 1.0))
+        _end = float(_win["value"][-1]) if _win.height else _start
+        speed_plot = pl.concat([
+            pl.DataFrame({"t": [float(_t0)], "value": [_start],
+                          "signal": ["internalSpeed"]}),
+            _win.select("t", "value", "signal"),
+            pl.DataFrame({"t": [float(_t1)], "value": [_end],
+                          "signal": ["internalSpeed"]}),
+        ]).sort("t")
+    else:
+        speed_plot = speed_long
+
+    # Dynamic y: floor at 0, top at the fastest speed visible (never below 1.05
+    # so a steady-1x game still reads sensibly). Handles fast-forward up to ~20x.
+    _ymax = max(1.05, float(speed_plot["value"].max()))
+
     health_lines = (
-        alt.Chart(speed_long)
-        .mark_line(interpolate="step-after", strokeWidth=1.6)
+        alt.Chart(speed_plot)
+        .mark_line(
+            interpolate="step-after", strokeWidth=1.6, clip=True, color="#FF5252"
+        )
         .encode(
-            x=alt.X("t:Q", title="Game time (s)"),
+            x=alt.X("t:Q", title="Game time (sim s)", scale=_xscale),
             y=alt.Y(
                 "value:Q",
                 title="Speed multiplier",
-                scale=alt.Scale(domain=[0, 1.05]),
-            ),
-            color=alt.Color(
-                "signal:N",
-                title=None,
-                scale=alt.Scale(
-                    domain=["internalSpeed"],
-                    range=["#1f77b4"],
-                ),
-                legend=alt.Legend(orient="right", labelLimit=140),
+                scale=alt.Scale(domain=[0, _ymax]),
             ),
             tooltip=[
                 alt.Tooltip("t:Q", format=".1f"),
-                alt.Tooltip("signal:N"),
-                alt.Tooltip("value:Q", format=".3f"),
+                alt.Tooltip("value:Q", format=".3f", title="speed"),
             ],
         )
     )
-
-    # Cliff markers: 5 s buckets that contain >=1 saturated perf sample or
-    # >=1 fps<=2 sample. These flag client-side "past the cliff" windows.
-    cliff_rows = []
-    if not perf_df.is_empty() and "simFrameMsQuality" in perf_df.columns:
-        sat = perf_df.filter(pl.col("simFrameMsQuality") == "saturated").select(
-            t=(pl.col("t") // 5 * 5)
-        ).with_columns(kind=pl.lit("saturated cpu"))
-        cliff_rows.append(sat)
-    if not fps_df.is_empty():
-        floor = fps_df.filter(pl.col("fps") <= 2).select(
-            t=(pl.col("t") // 5 * 5)
-        ).with_columns(kind=pl.lit("fps ≤ 2"))
-        cliff_rows.append(floor)
-    cliffs = pl.concat(cliff_rows).unique() if cliff_rows else pl.DataFrame()
-
-    if not cliffs.is_empty():
-        cliff_marks = (
-            alt.Chart(cliffs)
-            .mark_rule(opacity=0.25, strokeWidth=2)
-            .encode(
-                x="t:Q",
-                color=alt.Color(
-                    "kind:N",
-                    scale=alt.Scale(
-                        domain=["saturated cpu", "fps ≤ 2"],
-                        range=["#d62728", "#ff7f0e"],
-                    ),
-                    legend=alt.Legend(orient="right", labelLimit=140),
-                ),
-                tooltip=[alt.Tooltip("t:Q", format=".0f"), alt.Tooltip("kind:N")],
-            )
-        )
-        health_chart = (cliff_marks + health_lines).properties(
-            height=300,
-            width="container",
-            padding={"left": 5, "top": 5, "bottom": 5, "right": 73},
-            title="Server speed & client cliff markers",
-        )
-    else:
-        health_chart = health_lines.properties(
+    # Layer dashed pause markers; width must sit on the outer layered chart.
+    _rule = pause_marks(_dom, _xscale)
+    _speed = health_lines if _rule is None else alt.layer(health_lines, _rule)
+    health_chart = mo.ui.altair_chart(
+        _speed.properties(
             height=300,
             width="container",
             padding={"left": 5, "top": 5, "bottom": 5, "right": 50},
-            title="Server speed (no cliffs detected)",
-        )
+            title="Sim speed",
+        ),
+        chart_selection=False, legend_selection=False,
+    )
     return (health_chart,)
 
 
@@ -650,133 +772,202 @@ def _(alt, duration_s, fps_df, perf_df, pl, speed_df):
 def _(
     alt,
     fps_df,
+    frametime_df,
     mo,
+    pause_marks,
     perf_df,
     pl,
     player_colors,
     player_selector,
     players_df,
-    quality_filter,
+    scrubber,
     smoothing,
+    stat_filter,
+    zoom_domain,
 ):
-    # --- Per-player time series tab ---------------------------------------
-    selected_pids = list(player_selector.value)
+    # --- Combined performance charts (sim, draw, FPS) ---------------------
+    # Sim timing prefers the engine-measured broadcasts
+    # (game_frametime_broadcast.lua, recent BAR builds); when a demo carries
+    # none it falls back to the cpuUsage-derived approximation. Draw timing
+    # exists only in the measured format. FPS is always shown. The sim-speed
+    # chart is built in its own (health_chart) cell, appended after these.
+    _dom = zoom_domain(scrubber)
+    _xscale = alt.Scale(domain=_dom) if _dom else alt.Undefined
+    _sel = list(player_selector.value)
+    _stats = list(stat_filter.value)  # subset of {"mean", "peak"} for measured
+    _measured = not frametime_df.is_empty()
     _color_scale = alt.Scale(
         domain=list(player_colors.keys()),
         range=list(player_colors.values()),
     )
+    _height = max(280, 14 * len(_sel) + 60)
+    _XTITLE = "Game time (sim s)"
 
-    def _smooth(df, value_col):
-        win = max(2, int(smoothing.value) or 2)
+    # One smoothing rule for every per-player line chart: average each series
+    # into `win`-second tumbling bins (mean per bin), keyed on `by`. Applied
+    # identically to measured sim/draw, approx sim, and FPS so the slider
+    # behaves the same everywhere.
+    _win = max(2, int(smoothing.value) or 2)
+
+    def _smooth(df, value_col, by):
         if df.is_empty():
             return df
         return (
-            df.with_columns(t_bin=(pl.col("t") // win * win))
-            .group_by(["t_bin", "playerNum"])
+            df.with_columns(t_bin=(pl.col("t") // _win * _win))
+            .group_by([*by, "t_bin"])
             .agg(pl.col(value_col).mean())
             .rename({"t_bin": "t"})
-            .sort(["playerNum", "t"])
+            .sort([*by, "t"])
         )
 
-    perf_clean = perf_df.filter(
-        pl.col("simFrameMsQuality").is_in(quality_filter.value)
-        & pl.col("simFrameMs").is_not_null()
-        & pl.col("playerNum").is_in(selected_pids)
-    )
-    fps_clean = fps_df.filter(pl.col("playerNum").is_in(selected_pids))
-
-    perf_plot = (
-        _smooth(perf_clean, "simFrameMs")
-        .join(players_df.select(["playerNum", "name"]), on="playerNum")
-    ) if not perf_clean.is_empty() else pl.DataFrame()
-    fps_plot = (
-        _smooth(fps_clean, "fps")
-        .join(players_df.select(["playerNum", "name"]), on="playerNum")
-    ) if not fps_clean.is_empty() else pl.DataFrame()
-
-    _per_player_chart_height = max(280, 14 * len(selected_pids) + 60)
-
-    sim_chart = (
-        alt.Chart(perf_plot)
-        .mark_line(opacity=0.75, strokeWidth=1.2)
-        .encode(
-            x=alt.X("t:Q", title="Game time (s)"),
-            y=alt.Y("simFrameMs:Q", title="Sim frame (ms)"),
-            color=alt.Color(
-                "name:N",
-                scale=_color_scale,
-                title="Player",
-                legend=alt.Legend(orient="right", labelLimit=140),
-            ),
-            tooltip=[
-                alt.Tooltip("name:N", title="Player"),
-                alt.Tooltip("t:Q", format=".0f", title="t (s)"),
-                alt.Tooltip("simFrameMs:Q", format=".2f"),
-            ],
-        )
-        .properties(
-            height=_per_player_chart_height,
-            width="container",
+    def _finalize(base, height, title, subtitle):
+        # Layer dashed pause markers under the title/width wrapper. width must
+        # live on the outer (layered) chart, not the inner marks, to keep the
+        # container-responsive sizing working.
+        rule = pause_marks(_dom, _xscale)
+        layered = base if rule is None else alt.layer(base, rule)
+        chart = layered.properties(
+            height=height, width="container",
             padding={"left": 5, "top": 5, "bottom": 5, "right": 50},
-            title=alt.TitleParams(
-                "Sim frame timing per player (approx.)",
-                subtitle="Lower is better — ms of CPU spent per sim frame",
-                subtitleColor="#888",
-            ),
+            title=alt.TitleParams(title, subtitle=subtitle, subtitleColor="#888"),
         )
-    )
+        return mo.ui.altair_chart(
+            chart, chart_selection=False, legend_selection=False)
 
-    fps_chart = (
-        alt.Chart(fps_plot)
-        .mark_line(opacity=0.75, strokeWidth=1.2)
-        .encode(
-            x=alt.X("t:Q", title="Game time (s)"),
-            y=alt.Y("fps:Q", title="Render FPS"),
-            color=alt.Color(
-                "name:N",
-                scale=_color_scale,
-                title="Player",
-                legend=alt.Legend(orient="right", labelLimit=140),
-            ),
-            tooltip=[
-                alt.Tooltip("name:N", title="Player"),
-                alt.Tooltip("t:Q", format=".0f", title="t (s)"),
-                alt.Tooltip("fps:Q", format=".0f"),
-            ],
+    def _measured_base(avg_col, peak_col):
+        # avg (solid) + peak (dashed), filtered by the mean/peak stat selector.
+        ft = (
+            frametime_df.filter(pl.col("playerNum").is_in(_sel))
+            .join(players_df.select(["playerNum", "name"]), on="playerNum")
         )
-        .properties(
-            height=_per_player_chart_height,
-            width="container",
-            padding={"left": 5, "top": 5, "bottom": 5, "right": 50},
-            title=alt.TitleParams(
-                "Render FPS per player",
-                subtitle="Higher is better — FPS ≤ 2 means the engine hit its draw-floor",
-                subtitleColor="#888",
-            ),
+        if _dom:
+            ft = ft.filter(pl.col("t").is_between(_dom[0], _dom[1]))
+        long = (
+            ft.select("name", "t", mean=pl.col(avg_col), peak=pl.col(peak_col))
+            .unpivot(
+                index=["name", "t"], on=["mean", "peak"],
+                variable_name="stat", value_name="ms",
+            )
+            .filter(pl.col("stat").is_in(_stats))
         )
-    )
+        long = _smooth(long, "ms", ["name", "stat"])
+        return (
+            alt.Chart(long)
+            .mark_line(opacity=0.8, strokeWidth=1.3, clip=True)
+            .encode(
+                x=alt.X("t:Q", title=_XTITLE, scale=_xscale),
+                y=alt.Y("ms:Q", title="Frame time (ms)"),
+                color=alt.Color(
+                    "name:N", scale=_color_scale, title="Player",
+                    legend=alt.Legend(orient="right", labelLimit=140),
+                ),
+                strokeDash=alt.StrokeDash(
+                    "stat:N", title=None,
+                    scale=alt.Scale(domain=["mean", "peak"],
+                                    range=[[1, 0], [4, 3]]),
+                ),
+                tooltip=[
+                    alt.Tooltip("name:N", title="Player"),
+                    alt.Tooltip("t:Q", format=".0f", title="t (s)"),
+                    alt.Tooltip("stat:N"),
+                    alt.Tooltip("ms:Q", format=".1f"),
+                ],
+            )
+        )
 
-    ts_charts = mo.vstack(
-        [mo.ui.altair_chart(sim_chart), mo.ui.altair_chart(fps_chart)]
-    )
-    return (ts_charts,)
+    def _approx_sim_base():
+        # cpuUsage-derived fallback; trustworthy quality bands only, smoothed.
+        clean = perf_df.filter(
+            pl.col("simFrameMsQuality").is_in(("exact", "approx"))
+            & pl.col("simFrameMs").is_not_null()
+            & pl.col("playerNum").is_in(_sel)
+        )
+        if _dom:
+            clean = clean.filter(pl.col("t").is_between(_dom[0], _dom[1]))
+        plot = (
+            _smooth(clean, "simFrameMs", ["playerNum"])
+            .join(players_df.select(["playerNum", "name"]), on="playerNum")
+        ) if not clean.is_empty() else pl.DataFrame()
+        return (
+            alt.Chart(plot)
+            .mark_line(opacity=0.75, strokeWidth=1.2, clip=True)
+            .encode(
+                x=alt.X("t:Q", title=_XTITLE, scale=_xscale),
+                y=alt.Y("simFrameMs:Q", title="Sim frame (ms)"),
+                color=alt.Color(
+                    "name:N", scale=_color_scale, title="Player",
+                    legend=alt.Legend(orient="right", labelLimit=140),
+                ),
+                tooltip=[
+                    alt.Tooltip("name:N", title="Player"),
+                    alt.Tooltip("t:Q", format=".0f", title="t (s)"),
+                    alt.Tooltip("simFrameMs:Q", format=".2f"),
+                ],
+            )
+        )
+
+    def _fps_base():
+        clean = fps_df.filter(pl.col("playerNum").is_in(_sel))
+        if _dom:
+            clean = clean.filter(pl.col("t").is_between(_dom[0], _dom[1]))
+        plot = (
+            _smooth(clean, "fps", ["playerNum"])
+            .join(players_df.select(["playerNum", "name"]), on="playerNum")
+        ) if not clean.is_empty() else pl.DataFrame()
+        return (
+            alt.Chart(plot)
+            .mark_line(opacity=0.75, strokeWidth=1.2, clip=True)
+            .encode(
+                x=alt.X("t:Q", title=_XTITLE, scale=_xscale),
+                y=alt.Y("fps:Q", title="Render FPS"),
+                color=alt.Color(
+                    "name:N", scale=_color_scale, title="Player",
+                    legend=alt.Legend(orient="right", labelLimit=140),
+                ),
+                tooltip=[
+                    alt.Tooltip("name:N", title="Player"),
+                    alt.Tooltip("t:Q", format=".0f", title="t (s)"),
+                    alt.Tooltip("fps:Q", format=".0f"),
+                ],
+            )
+        )
+
+    _charts = []
+    if _measured:
+        _charts.append(_finalize(
+            _measured_base("avgSim", "simPeak"), 300, "Measured sim frame time",
+            "Engine profiler — avg (solid) & peak (dashed) ms per sim frame"))
+        _charts.append(_finalize(
+            _measured_base("avgDraw", "drawPeak"), 300, "Measured draw frame time",
+            "Engine profiler — avg (solid) & peak (dashed) ms per draw frame"))
+    else:
+        _charts.append(_finalize(
+            _approx_sim_base(), _height, "Sim frame timing per player (approx.)",
+            "Lower is better — ms per sim frame, approximated from CPU load "
+            "(no measured broadcasts in this demo)."))
+    _charts.append(_finalize(
+        _fps_base(), _height, "Render FPS per player",
+        "Higher is better — FPS ≤ 2 means the engine hit its draw-floor"))
+
+    perf_view = mo.vstack(_charts)
+    return (perf_view,)
 
 
 @app.cell
 def _(
     alt,
     fps_df,
+    frametime_df,
     mo,
     perf_df,
     pl,
     player_colors,
     players_df,
     players_enriched,
-    quality_filter,
 ):
     # --- Whole-game summary tab -------------------------------------------
     perf_for_summary = perf_df.filter(
-        pl.col("simFrameMsQuality").is_in(quality_filter.value)
+        pl.col("simFrameMsQuality").is_in(("exact", "approx"))
         & pl.col("simFrameMs").is_not_null()
     )
 
@@ -840,27 +1031,69 @@ def _(
         domain=list(player_colors.keys()),
         range=list(player_colors.values()),
     )
-    summary_bar = (
-        alt.Chart(summary_sorted.drop_nulls("mean_sim_ms"))
-        .mark_bar(opacity=0.85)
-        .encode(
-            y=alt.Y("name:N", sort="-x", title="Player"),
-            x=alt.X("mean_sim_ms:Q", title="Mean sim frame (ms)"),
-            color=alt.Color("name:N", scale=_color_scale, legend=None),
-            tooltip=[
-                alt.Tooltip("name:N", title="Player"),
-                alt.Tooltip("allyTeamId:N", title="Ally team"),
-                alt.Tooltip("mean_sim_ms:Q", format=".2f"),
-                alt.Tooltip("p95_sim_ms:Q", format=".2f", title="p95 sim ms"),
-                alt.Tooltip("mean_fps:Q", format=".1f"),
-                alt.Tooltip("p5_fps:Q", format=".1f", title="p5 fps"),
-                alt.Tooltip("n_saturated:Q", title="# saturated"),
-                alt.Tooltip("n_fps_floor:Q", title="# fps≤2"),
-            ],
+    _players = players_df.select(["playerNum", "name", "allyTeamId"])
+
+    def _bar(src, title, x_title, peak_title):
+        # Horizontal mean-per-player bar; `src` carries `value` (+ `peak`).
+        d = (
+            src.join(_players, on="playerNum")
+            .drop_nulls("value")
+            .sort("value", descending=True, nulls_last=True)
         )
-        .properties(height=24 * max(1, summary_sorted.height), width="container")
-    )
-    return summary_bar, summary_table
+        chart = (
+            alt.Chart(d)
+            .mark_bar(opacity=0.85)
+            .encode(
+                y=alt.Y("name:N", sort="-x", title="Player"),
+                x=alt.X("value:Q", title=x_title),
+                color=alt.Color("name:N", scale=_color_scale, legend=None),
+                tooltip=[
+                    alt.Tooltip("name:N", title="Player"),
+                    alt.Tooltip("allyTeamId:N", title="Ally team"),
+                    alt.Tooltip("value:Q", format=".2f", title=x_title),
+                    alt.Tooltip("peak:Q", format=".2f", title=peak_title),
+                ],
+            )
+            .properties(
+                height=24 * max(1, d.height), width="container", title=title)
+        )
+        return mo.ui.altair_chart(
+            chart, chart_selection=False, legend_selection=False)
+
+    # Sim bar: prefer engine-measured avgSim/simPeak; fall back to the cpuUsage
+    # approximation (mean simFrameMs / p95) when a demo has no #ft broadcasts.
+    if not frametime_df.is_empty():
+        _sim_src = frametime_df.group_by("playerNum").agg(
+            value=pl.col("avgSim").mean(), peak=pl.col("simPeak").max())
+        sim_bar = _bar(
+            _sim_src, "Sim frame time per player (measured)",
+            "Mean sim frame (ms)", "peak sim ms")
+    else:
+        _sim_src = (
+            perf_for_summary.group_by("playerNum").agg(
+                value=pl.col("simFrameMs").mean(),
+                peak=pl.col("simFrameMs").quantile(0.95))
+            if not perf_for_summary.is_empty()
+            else pl.DataFrame(schema={
+                "playerNum": pl.Int64, "value": pl.Float64, "peak": pl.Float64})
+        )
+        sim_bar = _bar(
+            _sim_src, "Sim frame time per player (approx)",
+            "Mean sim frame (ms)", "p95 sim ms")
+
+    # Draw bar: measured only — there's no cpuUsage approximation for draw time.
+    if not frametime_df.is_empty():
+        _draw_src = frametime_df.group_by("playerNum").agg(
+            value=pl.col("avgDraw").mean(), peak=pl.col("drawPeak").max())
+        draw_view = _bar(
+            _draw_src, "Draw frame time per player (measured)",
+            "Mean draw frame (ms)", "peak draw ms")
+    else:
+        draw_view = mo.md(
+            "_No measured draw-frame data in this demo — draw timing only "
+            "exists in recent BAR builds (`game_frametime_broadcast.lua`)._"
+        )
+    return draw_view, sim_bar, summary_table
 
 
 @app.cell
@@ -884,11 +1117,22 @@ def _(hardware_df, mo):
 
 
 @app.cell
-def _(hardware_view, health_chart, mo, summary_bar, summary_table, ts_charts):
+def _(
+    draw_view,
+    hardware_view,
+    health_chart,
+    mo,
+    perf_view,
+    scrubber,
+    sim_bar,
+    summary_table,
+):
     mo.ui.tabs(
         {
-            "Time Series": mo.vstack([health_chart, ts_charts]),
-            "Summary": mo.vstack([summary_table, summary_bar]),
+            "Performance": mo.vstack(
+                [scrubber, perf_view, health_chart]
+            ),
+            "Summary": mo.vstack([summary_table, sim_bar, draw_view]),
             "Hardware": hardware_view,
         },
         lazy=True,
